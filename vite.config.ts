@@ -1,7 +1,7 @@
 import { paraglideVitePlugin } from '@inlang/paraglide-js';
 import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
@@ -20,6 +20,10 @@ export default defineConfig({
 	},
 	optimizeDeps: {
 		exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util']
+	},
+	test: {
+		include: ['src/**/*.test.ts'],
+		environment: 'node'
 	},
 	server: {
 		headers: {
