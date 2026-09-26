@@ -2,7 +2,7 @@
 	import { FFmpeg } from '@ffmpeg/ffmpeg';
 	// @ts-ignore
 	import type { LogEvent, ProgressEvent } from '@ffmpeg/ffmpeg/dist/esm/types';
-	import { fetchFile, toBlobURL } from '@ffmpeg/util';
+	import { toBlobURL } from '@ffmpeg/util';
 	import { onMount } from 'svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
@@ -18,34 +18,23 @@
 	import ThemeSelector from '$lib/components/ui/selector/theme-selector.svelte';
 	import Settings from '@lucide/svelte/icons/settings';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
+	import type { VideoMetadata } from '$lib/compression/settings';
+	import {
+		buildAudioOnlyArgs,
+		buildCompressionArgs,
+		type TrimOptions
+	} from '$lib/compression/args';
+	import {
+		parseFpsFromLog,
+		runFFmpeg,
+		toProgressPercent,
+		withMountedFile
+	} from '$lib/compression/ffmpeg';
 
 	interface CompressionTarget {
 		label: string;
 		value: number;
 		description: string;
-	}
-
-	interface VideoMetadata {
-		duration: number;
-		bitrate: number;
-		resolution: string;
-		codec: string;
-		size: number;
-		fps: number;
-		hasMotion: boolean;
-	}
-
-	interface CompressionSettings {
-		videoBitrate: string;
-		audioBitrate: string;
-		resolution: string;
-		crf: number;
-		preset: string;
-		tune: string;
-		bufferSize: string;
-		refs: number;
-		bframes: number;
-		targetFps: number;
 	}
 
 	let ffmpeg = $state<FFmpeg>();
@@ -128,7 +117,9 @@
 			});
 
 			ffmpeg.on('progress', ({ progress: prog }: ProgressEvent) => {
-				progress = Math.round(prog * 100);
+				const percent = toProgressPercent(prog);
+				if (percent === null) return;
+				progress = percent;
 				if (startTime > 0 && progress > 5) {
 					const elapsed = (Date.now() - startTime) / 1000;
 					const rate = progress / elapsed;
@@ -153,6 +144,12 @@
 			errorMessage = 'Failed to load FFmpeg. Please refresh the page.';
 			message = 'Failed to load FFmpeg';
 		}
+	};
+
+	const reloadFFmpeg = async (): Promise<void> => {
+		ffmpeg?.terminate();
+		isLoaded = false;
+		await loadFFmpeg();
 	};
 
 	const handleFileSelect = (event: Event): void => {
@@ -189,51 +186,29 @@
 			return 30;
 		}
 
-		const inputName = `fps_detect_${Date.now()}.mp4`;
+		const instance = ffmpeg;
 
 		try {
-			await ffmpeg.writeFile(inputName, await fetchFile(file));
-
-			let detectedFps = 30;
-			let foundFps = false;
+			let detectedFps: number | null = null;
 
 			const logHandler = ({ message: msg }: LogEvent) => {
-				if (!foundFps) {
-					// Look for "X fps" or "X tbr" in stream info line
-					// Example: "1920x1080, 13174 kb/s, 59.96 fps, 59.94 tbr, 600 tbn"
-					const fpsMatch = msg.match(/,\s*(\d+\.?\d*)\s*fps/i);
-					const tbrMatch = msg.match(/(\d+\.?\d*)\s*tbr/i);
-
-					if (fpsMatch) {
-						detectedFps = Math.round(parseFloat(fpsMatch[1]));
-						foundFps = true;
-					} else if (tbrMatch && !foundFps) {
-						detectedFps = Math.round(parseFloat(tbrMatch[1]));
-						foundFps = true;
-					}
-				}
+				detectedFps ??= parseFpsFromLog(msg);
 			};
 
-			ffmpeg.on('log', logHandler);
+			instance.on('log', logHandler);
 
 			try {
-				// Extract only 1 frame to minimize processing time
-				await ffmpeg.exec(['-i', inputName, '-frames:v', '1', '-f', 'null', '-']);
-			} catch (e) {
-				// Command may fail but we get the metadata we need
+				await withMountedFile(instance, file, `/probe_${Date.now()}`, (inputPath) =>
+					instance.exec(['-i', inputPath, '-frames:v', '1', '-f', 'null', '-'])
+				);
+			} finally {
+				instance.off('log', logHandler);
 			}
 
-			ffmpeg.off('log', logHandler);
-			await ffmpeg.deleteFile(inputName);
-
-			return detectedFps;
+			return detectedFps ?? 30;
 		} catch (error) {
 			console.error('FPS detection failed:', error);
-			// Clean up on error
-			try {
-				await ffmpeg.deleteFile(inputName);
-			} catch {}
-			return 30; // Fallback
+			return 30;
 		}
 	};
 
@@ -290,91 +265,6 @@
 		}
 	};
 
-	const calculateOptimalResolution = (
-		originalWidth: number,
-		originalHeight: number,
-		maxWidth: number
-	): string => {
-		if (originalWidth <= maxWidth) {
-			return `${originalWidth}x${originalHeight}`;
-		}
-
-		const aspectRatio = originalWidth / originalHeight;
-		const newWidth = maxWidth;
-		const newHeight = Math.round(newWidth / aspectRatio);
-
-		const evenWidth = newWidth % 2 === 0 ? newWidth : newWidth - 1;
-		const evenHeight = newHeight % 2 === 0 ? newHeight : newHeight - 1;
-
-		return `${evenWidth}x${evenHeight}`;
-	};
-
-	const calculateCompressionSettings = (
-		targetSize: number,
-		metadata: VideoMetadata,
-		preserveOriginalFps: boolean
-	): CompressionSettings => {
-		const efficiency = metadata.hasMotion ? 0.8 : 0.85;
-		const targetBitrate = Math.round(((targetSize * 8) / metadata.duration / 1000) * efficiency);
-		const audioBitrate = Math.min(128, Math.round(targetBitrate * 0.12));
-		const videoBitrate = Math.max(200, targetBitrate - audioBitrate);
-
-		let resolution = metadata.resolution;
-		let crf = 23;
-		let preset = 'veryfast';
-		let tune = 'film';
-		let refs = 1;
-		let bframes = 0;
-		let targetFps = metadata.fps;
-		let fpsCap = metadata.fps;
-
-		const [width, height] = metadata.resolution.split('x').map(Number);
-
-		if (targetSize <= 8 * 1024 * 1024) {
-			const maxWidth = metadata.hasMotion ? 1024 : 854;
-			if (width > maxWidth) {
-				resolution = calculateOptimalResolution(width, height, maxWidth);
-			}
-			crf = metadata.hasMotion ? 18 : 26;
-			fpsCap = 24;
-		} else if (targetSize <= 25 * 1024 * 1024) {
-			const maxWidth = metadata.hasMotion ? 1440 : 1280;
-			if (width > maxWidth) {
-				resolution = calculateOptimalResolution(width, height, maxWidth);
-			}
-			crf = metadata.hasMotion ? 16 : 24;
-			fpsCap = 30;
-		} else if (targetSize <= 50 * 1024 * 1024) {
-			if (width > 1920) {
-				resolution = calculateOptimalResolution(width, height, 1920);
-			}
-			crf = metadata.hasMotion ? 14 : 22;
-			fpsCap = 30;
-		} else {
-			crf = metadata.hasMotion ? 12 : 20;
-			fpsCap = 30;
-		}
-
-		if (!preserveOriginalFps) {
-			targetFps = Math.min(targetFps, fpsCap);
-		}
-
-		const bufferSize = metadata.hasMotion ? `${videoBitrate * 3}k` : `${videoBitrate * 2}k`;
-
-		return {
-			videoBitrate: `${videoBitrate}k`,
-			audioBitrate: `${audioBitrate}k`,
-			resolution,
-			crf,
-			preset,
-			tune,
-			bufferSize,
-			refs,
-			bframes,
-			targetFps
-		};
-	};
-
 	const compressVideo = async (): Promise<void> => {
 		if (!selectedFile || !isLoaded || !videoMetadata || !ffmpeg) return;
 
@@ -384,158 +274,36 @@
 		startTime = Date.now();
 		estimatedTimeRemaining = 0;
 
+		const instance = ffmpeg;
+		const metadata = videoMetadata;
 		try {
-			const inputDir = '/input';
-			await ffmpeg.createDir(inputDir);
-
 			message = 'Mounting input file...';
-			await ffmpeg.mount('WORKERFS' as any, { files: [selectedFile] }, inputDir);
+			const trim: TrimOptions = { enabled: trimVideo, skipFirstSeconds, skipLastSeconds };
+			const data = await withMountedFile(instance, selectedFile, '/input', (inputPath) => {
+				const args = audioOnlyMode
+					? buildAudioOnlyArgs(inputPath, metadata.duration, trim, muteSound)
+					: buildCompressionArgs(inputPath, metadata, {
+							targetSize: selectedTarget.value,
+							preserveOriginalFps,
+							muteSound,
+							threadCount: isChromium ? getOptimalThreadCount() : 1,
+							trim
+						});
+				message = audioOnlyMode ? 'Processing audio only...' : 'Starting compression...';
+				console.log('FFmpeg args:', args);
+				return runFFmpeg(instance, args);
+			});
 
-			// If audio-only mode, use the dedicated logic
-			if (audioOnlyMode) {
-				message = 'Processing audio only...';
-
-				const args: string[] = [];
-				if (trimVideo && skipFirstSeconds > 0) {
-					args.push('-ss', skipFirstSeconds.toString());
-				}
-				
-				args.push('-i', `${inputDir}/${selectedFile.name}`);
-
-				if (trimVideo && (skipFirstSeconds > 0 || skipLastSeconds > 0)) {
-					const targetDuration = videoMetadata.duration - skipFirstSeconds - skipLastSeconds;
-					if (targetDuration > 0) {
-						args.push('-t', targetDuration.toString());
-					}
-				}
-
-				args.push('-c:v', 'copy'); // Copy video stream without re-encoding
-
-				// Handle audio based on muteSound setting
-				if (muteSound) {
-					args.push('-an'); // Remove audio completely
-				} else {
-					// Keep original audio
-					args.push('-c:a', 'copy');
-				}
-
-				args.push('-movflags', '+faststart', '-f', 'mp4', '-y', 'output.mp4');
-
-				console.log('FFmpeg audio-only args:', args);
-
-				await ffmpeg.exec(args);
-
-				message = 'Reading processed video...';
-				const data = (await ffmpeg.readFile('output.mp4')) as Uint8Array;
-				processedVideo = data;
-				compressedSize = data.length;
-
-				await ffmpeg.unmount(inputDir);
-				await ffmpeg.deleteDir(inputDir);
-				await ffmpeg.deleteFile('output.mp4');
-
-				message = 'Audio processing completed successfully!';
-				return;
-			}
-
-			const settings = calculateCompressionSettings(
-				selectedTarget.value,
-				videoMetadata,
-				preserveOriginalFps
-			);
-			const threadCount = isChromium ? getOptimalThreadCount() : 0;
-
-			message = 'Starting compression...';
-
-			const args: string[] = [];
-			
-			if (trimVideo && skipFirstSeconds > 0) {
-				args.push('-ss', skipFirstSeconds.toString());
-			}
-
-			args.push(
-				'-i',
-				`${inputDir}/${selectedFile.name}`
-			);
-
-			if (trimVideo && (skipFirstSeconds > 0 || skipLastSeconds > 0)) {
-				const targetDuration = videoMetadata.duration - skipFirstSeconds - skipLastSeconds;
-				if (targetDuration > 0) {
-					args.push('-t', targetDuration.toString());
-				}
-			}
-
-			args.push(
-				'-c:v',
-				'libx264',
-				'-preset',
-				'veryfast',
-				'-tune',
-				'film',
-				'-crf',
-				settings.crf.toString(),
-				'-maxrate',
-				settings.videoBitrate,
-				'-bufsize',
-				settings.bufferSize,
-				'-refs',
-				'1',
-				'-bf',
-				'0',
-				'-threads',
-				threadCount.toString(),
-				'-me_method',
-				'hex',
-				'-subq',
-				'3'
-			);
-
-			// Add audio settings only if not muting sound
-			if (!muteSound) {
-				args.push('-c:a', 'aac', '-b:a', settings.audioBitrate, '-ac', '2', '-ar', '48000');
-			} else {
-				// Remove audio completely
-				args.push('-an');
-			}
-
-			args.push('-movflags', '+faststart', '-f', 'mp4', '-y');
-
-			let videoFilters: string[] = [];
-
-			if (settings.resolution !== videoMetadata.resolution) {
-				videoFilters.push(`scale=${settings.resolution}:flags=fast_bilinear`);
-			}
-
-			if (settings.targetFps < videoMetadata.fps) {
-				videoFilters.push(`fps=${settings.targetFps}`);
-			}
-
-			if (videoFilters.length > 0) {
-				const filterComplex = videoFilters.join(',');
-				const audioCodecIndex = args.indexOf('-c:a');
-				args.splice(audioCodecIndex, 0, '-vf', filterComplex);
-			}
-
-			args.push('output.mp4');
-
-			console.log('FFmpeg args:', args);
-
-			await ffmpeg.exec(args);
-
-			message = 'Reading compressed video...';
-			const data = (await ffmpeg.readFile('output.mp4')) as Uint8Array;
 			processedVideo = data;
 			compressedSize = data.length;
-
-			await ffmpeg.unmount(inputDir);
-			await ffmpeg.deleteDir(inputDir);
-			await ffmpeg.deleteFile('output.mp4');
-
-			message = 'Compression completed successfully!';
+			message = audioOnlyMode
+				? 'Audio processing completed successfully!'
+				: 'Compression completed successfully!';
 		} catch (error) {
 			console.error('Compression failed:', error);
 			errorMessage = 'Video compression failed. Please try again with different settings.';
 			message = 'Compression failed';
+			await reloadFFmpeg();
 		} finally {
 			isProcessing = false;
 			progress = 0;
