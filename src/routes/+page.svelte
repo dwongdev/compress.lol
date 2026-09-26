@@ -30,6 +30,16 @@
 		toProgressPercent,
 		withMountedFile
 	} from '$lib/compression/ffmpeg';
+	import {
+		durationBucket,
+		failureReason,
+		fileContainer,
+		resolutionTier,
+		sizeBucket,
+		trackEvent,
+		type Browser,
+		type ProcessingMode
+	} from '$lib/analytics';
 
 	interface CompressionTarget {
 		label: string;
@@ -141,10 +151,17 @@
 			console.log('isLoaded set to:', isLoaded);
 		} catch (error) {
 			console.error('Failed to load FFmpeg:', error);
+			trackEvent('ffmpeg_load_failed', {
+				browser: browserFamily(),
+				cross_origin_isolated: globalThis.crossOriginIsolated === true
+			});
 			errorMessage = 'Failed to load FFmpeg. Please refresh the page.';
 			message = 'Failed to load FFmpeg';
 		}
 	};
+
+	const processingMode = (): ProcessingMode => (audioOnlyMode ? 'audio_only' : 'compress');
+	const browserFamily = (): Browser => (isChromiumByFeatures() ? 'chromium' : 'other');
 
 	const reloadFFmpeg = async (): Promise<void> => {
 		ffmpeg?.terminate();
@@ -165,6 +182,7 @@
 		) {
 			const maxSize = 5 * 1024 * 1024 * 1024;
 			if (file.size > maxSize) {
+				trackEvent('file_rejected', { reason: 'too_large' });
 				errorMessage = m.file_size_limit_error();
 				target.value = '';
 				return;
@@ -176,6 +194,9 @@
 			processedVideo = null;
 			getVideoMetadata(file);
 		} else {
+			if (file) {
+				trackEvent('file_rejected', { reason: 'unsupported_type' });
+			}
 			errorMessage = m.select_valid_video();
 		}
 	};
@@ -242,6 +263,12 @@
 						hasMotion
 					};
 					URL.revokeObjectURL(video.src);
+					trackEvent('video_selected', {
+						resolution: resolutionTier(videoMetadata.resolution),
+						size: sizeBucket(file.size),
+						duration: durationBucket(video.duration),
+						container: fileContainer(file.name)
+					});
 					resolve();
 				};
 			});
@@ -276,6 +303,18 @@
 
 		const instance = ffmpeg;
 		const metadata = videoMetadata;
+		const job = { mode: processingMode(), target: selectedTarget.label, browser: browserFamily() };
+		const resolution = resolutionTier(metadata.resolution);
+
+		trackEvent('compression_started', {
+			...job,
+			resolution,
+			fps: metadata.fps,
+			mute: muteSound,
+			preserve_fps: preserveOriginalFps,
+			trim: trimVideo
+		});
+
 		try {
 			message = 'Mounting input file...';
 			const trim: TrimOptions = { enabled: trimVideo, skipFirstSeconds, skipLastSeconds };
@@ -296,11 +335,22 @@
 
 			processedVideo = data;
 			compressedSize = data.length;
+			trackEvent('compression_succeeded', {
+				...job,
+				seconds: Math.round((Date.now() - startTime) / 1000),
+				reduction_percent: Math.round((1 - data.length / metadata.size) * 100)
+			});
 			message = audioOnlyMode
 				? 'Audio processing completed successfully!'
 				: 'Compression completed successfully!';
 		} catch (error) {
 			console.error('Compression failed:', error);
+			trackEvent('compression_failed', {
+				...job,
+				resolution,
+				fps: metadata.fps,
+				reason: failureReason(error)
+			});
 			errorMessage = 'Video compression failed. Please try again with different settings.';
 			message = 'Compression failed';
 			await reloadFFmpeg();
@@ -337,6 +387,7 @@
 		a.href = url;
 		document.body.appendChild(a);
 		a.click();
+		trackEvent('video_downloaded', { mode: processingMode(), target: selectedTarget.label });
 		document.body.removeChild(a);
 		URL.revokeObjectURL(url);
 	};

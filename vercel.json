@@ -2,6 +2,10 @@
 	"github": {
 		"silent": true
 	},
+	"rewrites": [
+		{ "source": "/stats/s.js", "destination": "https://cloud.umami.is/script.js" },
+		{ "source": "/stats/api/send", "destination": "https://cloud.umami.is/api/send" }
+	],
 	"headers": [
 		{
 			"source": "/(.*)",
