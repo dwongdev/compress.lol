@@ -119,6 +119,8 @@ describe('buildCompressionArgs', () => {
 			'hex',
 			'-subq',
 			'3',
+			'-pix_fmt',
+			'yuv420p',
 			'-vf',
 			'scale=1920x1080:flags=fast_bilinear,fps=30',
 			'-c:a',
@@ -139,6 +141,12 @@ describe('buildCompressionArgs', () => {
 		options: CompressionArgsOptions;
 		check: (args: string[]) => void;
 	}[] = [
+		{
+			name: '10-bit sources are encoded as widely playable 8-bit 4:2:0',
+			metadata: { ...video4k60, codec: 'h265' },
+			options: options({}),
+			check: (args) => expect(valueAfter(args, '-pix_fmt')).toBe('yuv420p')
+		},
 		{
 			name: 'never passes -threads 0',
 			metadata: video4k60,

@@ -81,7 +81,9 @@ export const buildCompressionArgs = (
 		'-me_method',
 		'hex',
 		'-subq',
-		'3'
+		'3',
+		'-pix_fmt',
+		'yuv420p'
 	);
 
 	const videoFilters: string[] = [];
